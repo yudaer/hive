@@ -18,12 +18,10 @@
 
 package org.apache.hadoop.hive.ql.exec.mr;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.Serializable;
+import java.io.*;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -85,11 +83,14 @@ import org.apache.hadoop.mapred.JobClient;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.Partitioner;
 import org.apache.hadoop.mapred.RunningJob;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.log4j.Appender;
 import org.apache.log4j.BasicConfigurator;
 import org.apache.log4j.FileAppender;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.varia.NullAppender;
+
+import javax.security.auth.login.LoginException;
 
 /**
  * ExecDriver is the central class in co-ordinating execution of any map-reduce task.
@@ -623,55 +624,9 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
     }
   }
 
-  @SuppressWarnings("unchecked")
-  public static void main(String[] args) throws IOException, HiveException {
-
-    String planFileName = null;
-    String jobConfFileName = null;
-    boolean noLog = false;
-    String files = null;
-    boolean localtask = false;
-    try {
-      for (int i = 0; i < args.length; i++) {
-        if (args[i].equals("-plan")) {
-          planFileName = args[++i];
-        } else if (args[i].equals("-jobconffile")) {
-          jobConfFileName = args[++i];
-        } else if (args[i].equals("-nolog")) {
-          noLog = true;
-        } else if (args[i].equals("-files")) {
-          files = args[++i];
-        } else if (args[i].equals("-localtask")) {
-          localtask = true;
-        }
-      }
-    } catch (IndexOutOfBoundsException e) {
-      System.err.println("Missing argument to option");
-      printUsage();
-    }
-
-    JobConf conf;
-    if (localtask) {
-      conf = new JobConf(MapredLocalTask.class);
-    } else {
-      conf = new JobConf(ExecDriver.class);
-    }
-
-    if (jobConfFileName != null) {
-      conf.addResource(new Path(jobConfFileName));
-    }
-
-    if (files != null) {
-      conf.set("tmpfiles", files);
-    }
-
-    if(ShimLoader.getHadoopShims().isSecurityEnabled()){
-      String hadoopAuthToken =
-          System.getenv(ShimLoader.getHadoopShims().getTokenFileLocEnvName());
-      if(hadoopAuthToken != null){
-        conf.set("mapreduce.job.credentials.binary", hadoopAuthToken);
-      }
-    }
+  private static void runAsRealUser(JobConf conf, String planFileName,
+                                    boolean noLog, boolean localtask)
+                throws IOException, HiveException, InterruptedException {
 
     boolean isSilent = HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVESESSIONSILENT);
 
@@ -701,7 +656,7 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
     // print out the location of the log file for the user so
     // that it's easy to find reason for local mode execution failures
     for (Appender appender : Collections.list((Enumeration<Appender>) LogManager.getRootLogger()
-        .getAllAppenders())) {
+            .getAllAppenders())) {
       if (appender instanceof FileAppender) {
         console.printInfo("Execution log at: " + ((FileAppender) appender).getFile());
       }
@@ -737,6 +692,7 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
       throw new HiveException(e.getMessage(), e);
     }
     int ret;
+
     if (localtask) {
       memoryMXBean = ManagementFactory.getMemoryMXBean();
       MapredLocalWork plan = Utilities.deserializePlan(pathData, MapredLocalWork.class, conf);
@@ -752,6 +708,79 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
     if (ret != 0) {
       System.exit(ret);
     }
+
+  }
+
+  @SuppressWarnings("unchecked")
+  public static void main(String[] args) throws IOException, HiveException, InterruptedException {
+
+    String planFileName = null;
+    String jobConfFileName = null;
+    boolean noLog = false;
+    String files = null;
+    boolean localtask = false;
+    try {
+      for (int i = 0; i < args.length; i++) {
+        if (args[i].equals("-plan")) {
+          planFileName = args[++i];
+        } else if (args[i].equals("-jobconffile")) {
+          jobConfFileName = args[++i];
+        } else if (args[i].equals("-nolog")) {
+          noLog = true;
+        } else if (args[i].equals("-files")) {
+          files = args[++i];
+        } else if (args[i].equals("-localtask")) {
+          localtask = true;
+        }
+      }
+    } catch (IndexOutOfBoundsException e) {
+      System.err.println("Missing argument to option");
+      printUsage();
+    }
+
+
+    final JobConf conf;
+    if (localtask) {
+      conf = new JobConf(MapredLocalTask.class);
+    } else {
+      conf = new JobConf(ExecDriver.class);
+    }
+
+    if (jobConfFileName != null) {
+      conf.addResource(new Path(jobConfFileName));
+    }
+
+    if (files != null) {
+      conf.set("tmpfiles", files);
+    }
+
+    if(ShimLoader.getHadoopShims().isSecurityEnabled()){
+      String hadoopAuthToken =
+              System.getenv(ShimLoader.getHadoopShims().getTokenFileLocEnvName());
+      if(hadoopAuthToken != null){
+        conf.set("mapreduce.job.credentials.binary", hadoopAuthToken);
+      }
+    }
+
+    final String planfileName_final = planFileName;
+    final boolean noLog_final = noLog;
+    final boolean localtask_final = localtask;
+    String username = conf.get("hive.session.user");
+    if (username != null) {
+      ShimLoader.getHadoopShims().doAs(
+              ShimLoader.getHadoopShims().createRemoteUser(username, null),
+              new PrivilegedExceptionAction<Object>() {
+                @Override
+                public Object run() throws Exception {
+                  runAsRealUser(conf, planfileName_final, noLog_final, localtask_final);
+                  return null;
+                }
+              });
+    } else {
+      runAsRealUser(conf, planFileName, noLog, localtask);
+    }
+
+
   }
 
   /**
@@ -776,6 +805,14 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
         continue;
       }
       tempConf.set(oneProp, hconf.get(oneProp));
+    }
+
+    try {
+      UserGroupInformation ugi = ShimLoader.getHadoopShims().getUGIForConf(tempConf);
+      String currentUser = ShimLoader.getHadoopShims().getShortUserName(ugi);
+      tempConf.set("hive.session.user", currentUser);
+    } catch (LoginException e) {
+      LOG.error(e);
     }
 
     // Multiple concurrent local mode job submissions can cause collisions in
